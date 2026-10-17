@@ -95,10 +95,29 @@ constexpr uint8_t SC7A20H_CTRL1_ODR_POWER_DOWN = 0x00;
 constexpr uint8_t SC7A20H_OUT_SHIFT = 4;
 constexpr float SC7A20H_MG_PER_LSB = 1.0f;  // ±2 g (SC7A20H_FS_2G)
 
+// Metalio E-Ink 4: Silan SC7A20H high-resolution, 100 Hz, ±2 g. Distinct from
+// Read Pico's 12.5 Hz low-power profile above; the two boards do not share an image.
+#if FREEINK_DEVICE_METALIO_EINK4
+constexpr uint8_t SC7A20H_VERSION_VALUE = 0x28;
+constexpr uint8_t SC7A20H_REG_CTRL3 = 0x22;
+constexpr uint8_t SC7A20H_REG_CTRL6 = 0x25;
+constexpr uint8_t SC7A20H_REG_STATUS = 0x27;
+constexpr uint8_t SC7A20H_REG_FIFO_CTRL = 0x2E;
+constexpr uint8_t SC7A20H_REG_SDO_PU = 0x57;
+constexpr uint8_t SC7A20H_STATUS_ZYXDA = 0x08;
+constexpr uint8_t SC7A20H_SDO_PU_DISABLE = 0x08;
+constexpr uint8_t SC7A20H_CTRL0_HR = 0x01;
+constexpr uint8_t SC7A20H_CTRL1_100HZ_XYZ = 0x57;  // ODR 100 Hz, high-resolution, XYZ
+constexpr uint8_t SC7A20H_CTRL1_SLEEP_XYZ = 0x07;  // ODR off, axis enables retained
+constexpr uint8_t SC7A20H_ADDR_SA0_HIGH = 0x19;
+constexpr uint8_t SC7A20H_ADDR_SA0_LOW = 0x18;
+constexpr float SC7A20H_HR_G_PER_LSB = 1.0f / 1024.0f;  // 0x4000 raw = 1 g, low 4 bits dropped
+#endif
+
 bool g_wireReady[2] = {false, false};
 TwoWire& sensorWire() {
-  const auto& s = BoardConfig::ACTIVE.sensors;
 #if SOC_I2C_NUM > 1
+  const auto& s = BoardConfig::ACTIVE.sensors;
   return s.i2cBus == 1 ? Wire1 : Wire;
 #else
   return Wire;
@@ -140,6 +159,42 @@ bool readRegs(uint8_t addr, uint8_t reg, uint8_t* dst, uint8_t len) {
   return true;
 }
 
+#if FREEINK_DEVICE_METALIO_EINK4
+bool sc7a20hIdentifies(uint8_t addr) {
+  uint8_t who = 0;
+  uint8_t version = 0;
+  if (!readRegs(addr, SC7A20H_REG_WHO_AM_I, &who, 1) || who != SC7A20H_WHO_AM_I_VALUE) return false;
+  if (!readRegs(addr, SC7A20H_REG_VERSION, &version, 1) || version != SC7A20H_VERSION_VALUE) return false;
+  return true;
+}
+
+bool sc7a20hPowerDown(uint8_t addr) { return writeReg(addr, SC7A20H_REG_CTRL1, SC7A20H_CTRL1_SLEEP_XYZ); }
+
+// Identity must already have passed. Any failed write powers the part down so a
+// retry does not leave it sampling, and present() stays false.
+bool sc7a20hConfigure(uint8_t addr) {
+  if (addr == SC7A20H_ADDR_SA0_LOW) {
+    uint8_t pull = 0;
+    if (!readRegs(addr, SC7A20H_REG_SDO_PU, &pull, 1) ||
+        !writeReg(addr, SC7A20H_REG_SDO_PU, static_cast<uint8_t>(pull | SC7A20H_SDO_PU_DISABLE))) {
+      sc7a20hPowerDown(addr);
+      return false;
+    }
+  }
+  const bool configured = writeReg(addr, SC7A20H_REG_CTRL0, SC7A20H_CTRL0_HR) &&
+                          writeReg(addr, SC7A20H_REG_CTRL2, 0x00) && writeReg(addr, SC7A20H_REG_CTRL3, 0x00) &&
+                          writeReg(addr, SC7A20H_REG_CTRL4, SC7A20H_CTRL4_BDU_2G) &&
+                          writeReg(addr, SC7A20H_REG_CTRL5, 0x00) && writeReg(addr, SC7A20H_REG_CTRL6, 0x00) &&
+                          writeReg(addr, SC7A20H_REG_FIFO_CTRL, 0x00) &&
+                          writeReg(addr, SC7A20H_REG_CTRL1, SC7A20H_CTRL1_100HZ_XYZ);
+  if (!configured) {
+    sc7a20hPowerDown(addr);
+    return false;
+  }
+  return true;
+}
+#endif
+
 bool qmi8658PresentAt(uint8_t addr) {
   uint8_t who = 0;
   return readRegs(addr, QMI8658_REG_WHO_AM_I, &who, 1) && who == QMI8658_WHO_AM_I_VALUE;
@@ -158,6 +213,7 @@ bool powerDownQmi8658(uint8_t addr) {
 
 bool Imu::begin() {
   begun_ = false;
+  sampling_ = false;
   addr_ = 0;
 
   const auto& s = BoardConfig::ACTIVE.sensors;
@@ -173,6 +229,7 @@ bool Imu::begin() {
       if (!writeReg(configuredAddr, REG_CTRL1_XL, CTRL1_XL_104HZ_2G)) return false;
       if (!writeReg(configuredAddr, REG_CTRL2_G, CTRL2_G_104HZ_245DPS)) return false;
       addr_ = configuredAddr;
+      sampling_ = true;
       break;
     case BoardConfig::ImuType::Qmi8658: {
       // SA0 selects between 0x6A and 0x6B. X3 production revisions have used
@@ -199,9 +256,27 @@ bool Imu::begin() {
         powerDownQmi8658(addr_);
         return false;
       }
+      sampling_ = true;
       break;
     }
     case BoardConfig::ImuType::Sc7a20h: {
+#if FREEINK_DEVICE_METALIO_EINK4
+      // Probe before any write. 0x19 is the strapped address; 0x18 is the SA0-low
+      // alternate and needs its grounded address pin's pull-up disabled.
+      const uint8_t alternateAddr =
+          configuredAddr == SC7A20H_ADDR_SA0_HIGH ? SC7A20H_ADDR_SA0_LOW : SC7A20H_ADDR_SA0_HIGH;
+      uint8_t found = 0;
+      if (sc7a20hIdentifies(configuredAddr)) {
+        found = configuredAddr;
+      } else if (sc7a20hIdentifies(alternateAddr)) {
+        found = alternateAddr;
+      } else {
+        return false;
+      }
+      if (!sc7a20hConfigure(found)) return false;
+      addr_ = found;
+      sampling_ = true;
+#else
       // Bring-up order from sc7a20h.c bring_up(): soft reset, then identity, then
       // CTRL5.BOOT, then the sensor config. The reset is what makes the following
       // identity read meaningful after a warm boot (the board's BoardReadPico
@@ -222,6 +297,8 @@ bool Imu::begin() {
       if (!writeReg(configuredAddr, SC7A20H_REG_CTRL1, SC7A20H_CTRL1_12_5HZ_LP_XYZ)) return false;
       delay(20);  // sc7a20h_apply_config() settle before the first sample
       addr_ = configuredAddr;
+      sampling_ = true;
+#endif
       break;
     }
     case BoardConfig::ImuType::None:
@@ -233,7 +310,7 @@ bool Imu::begin() {
 
 bool Imu::read(Sample& out) {
   const uint8_t addr = addr_;
-  if (!begun_ || addr == 0) return false;
+  if (!begun_ || !sampling_ || addr == 0) return false;
   const auto& s = BoardConfig::ACTIVE.sensors;
   uint8_t g[6] = {};
   uint8_t a[6] = {};
@@ -252,10 +329,16 @@ bool Imu::read(Sample& out) {
     accelScale = QMI8658_ACCEL_G_PER_LSB;
     gyroScale = QMI8658_GYRO_DPS_PER_LSB;
   } else if (s.imuType == BoardConfig::ImuType::Sc7a20h) {
+#if FREEINK_DEVICE_METALIO_EINK4
+    uint8_t status = 0;
+    if (!readRegs(addr, SC7A20H_REG_STATUS, &status, 1) || (status & SC7A20H_STATUS_ZYXDA) == 0) return false;
+    accelScale = SC7A20H_HR_G_PER_LSB;
+#else
+    accelScale = SC7A20H_MG_PER_LSB / 1000.0f;
+#endif
     if (!readRegs(addr, static_cast<uint8_t>(SC7A20H_REG_OUT_X_L | SC7A20H_REG_AUTO_INCREMENT), a, sizeof(a))) {
       return false;
     }
-    accelScale = SC7A20H_MG_PER_LSB / 1000.0f;
     gyroScale = 0.0f;
     accelShift = SC7A20H_OUT_SHIFT;
   } else {
@@ -300,45 +383,79 @@ bool Imu::read(Sample& out) {
 bool Imu::sleep() {
   const uint8_t addr = addr_;
   if (!begun_ || addr == 0) return false;
+  bool asleep = false;
   switch (BoardConfig::ACTIVE.sensors.imuType) {
     case BoardConfig::ImuType::Lsm6ds3:
-      return writeReg(addr, REG_CTRL1_XL, CTRL_ODR_POWER_DOWN) && writeReg(addr, REG_CTRL2_G, CTRL_ODR_POWER_DOWN);
+      asleep = writeReg(addr, REG_CTRL1_XL, CTRL_ODR_POWER_DOWN) && writeReg(addr, REG_CTRL2_G, CTRL_ODR_POWER_DOWN);
+      break;
     case BoardConfig::ImuType::Qmi8658:
       // CTRL7 only disables sampling; the internal oscillator keeps running.
       // SensorDisable is required for the QMI8658's full power-down mode.
-      return powerDownQmi8658(addr);
+      asleep = powerDownQmi8658(addr);
+      break;
     case BoardConfig::ImuType::Sc7a20h:
+#if FREEINK_DEVICE_METALIO_EINK4
+      // ODR off, XYZ enables retained (CTRL1 = 0x07). Output registers may still
+      // hold the last sample; sampling_ makes read() reject them.
+      asleep = sc7a20hPowerDown(addr);
+#else
       // CTRL1 ODR = 0000 shuts the sampling engine down (≈0.5 µA) and retains
       // every other config register, which is what wake() re-applies
       // (sc7a20h_power_down in sc7a20h.c).
-      return writeReg(addr, SC7A20H_REG_CTRL1, SC7A20H_CTRL1_ODR_POWER_DOWN);
+      asleep = writeReg(addr, SC7A20H_REG_CTRL1, SC7A20H_CTRL1_ODR_POWER_DOWN);
+#endif
+      break;
     case BoardConfig::ImuType::None:
       return false;
   }
-  return false;
+  if (asleep) sampling_ = false;
+  return asleep;
 }
 
 bool Imu::wake() {
   const uint8_t addr = addr_;
   if (!begun_ || addr == 0) return false;
+  bool awake = false;
   switch (BoardConfig::ACTIVE.sensors.imuType) {
     case BoardConfig::ImuType::Lsm6ds3:
-      return writeReg(addr, REG_CTRL1_XL, CTRL1_XL_104HZ_2G) && writeReg(addr, REG_CTRL2_G, CTRL2_G_104HZ_245DPS);
+      awake = writeReg(addr, REG_CTRL1_XL, CTRL1_XL_104HZ_2G) && writeReg(addr, REG_CTRL2_G, CTRL2_G_104HZ_245DPS);
+      break;
     case BoardConfig::ImuType::Qmi8658:
       // Re-enable the internal oscillator before restarting the sensors.
-      return writeReg(addr, QMI8658_REG_CTRL1, QMI8658_CTRL1_BASE) &&
-             writeReg(addr, QMI8658_REG_CTRL7, QMI8658_CTRL7_ACC_GYRO_ENABLE);
+      awake = writeReg(addr, QMI8658_REG_CTRL1, QMI8658_CTRL1_BASE) &&
+              writeReg(addr, QMI8658_REG_CTRL7, QMI8658_CTRL7_ACC_GYRO_ENABLE);
+      break;
     case BoardConfig::ImuType::Sc7a20h:
+#if FREEINK_DEVICE_METALIO_EINK4
+      // Sleep only cleared CTRL1's ODR. Restoring 100 Hz is enough; a failed
+      // write leaves read() rejected so a half-woken part is not sampled.
+      awake = writeReg(addr, SC7A20H_REG_CTRL1, SC7A20H_CTRL1_100HZ_XYZ);
+#else
       // Same config sequence as begin() (sc7a20h_power_up -> apply_config), minus
       // the soft reset: only CTRL1's ODR field was cleared, so the retained
       // CTRL0/CTRL2/CTRL4 values are rewritten for a defined state. The 20 ms
       // settle is sc7a20h_apply_config()'s.
-      if (!writeReg(addr, SC7A20H_REG_CTRL0, SC7A20H_CTRL0_IDLE)) return false;
-      if (!writeReg(addr, SC7A20H_REG_CTRL2, SC7A20H_CTRL2_IDLE)) return false;
-      if (!writeReg(addr, SC7A20H_REG_CTRL4, SC7A20H_CTRL4_BDU_2G)) return false;
-      if (!writeReg(addr, SC7A20H_REG_CTRL1, SC7A20H_CTRL1_12_5HZ_LP_XYZ)) return false;
-      delay(20);
+      awake = writeReg(addr, SC7A20H_REG_CTRL0, SC7A20H_CTRL0_IDLE) &&
+              writeReg(addr, SC7A20H_REG_CTRL2, SC7A20H_CTRL2_IDLE) &&
+              writeReg(addr, SC7A20H_REG_CTRL4, SC7A20H_CTRL4_BDU_2G) &&
+              writeReg(addr, SC7A20H_REG_CTRL1, SC7A20H_CTRL1_12_5HZ_LP_XYZ);
+      if (awake) delay(20);
+#endif
+      break;
+    case BoardConfig::ImuType::None:
+      return false;
+  }
+  sampling_ = awake;
+  return awake;
+}
+
+bool Imu::hasGyroscope() const {
+  if (!begun_) return false;
+  switch (BoardConfig::ACTIVE.sensors.imuType) {
+    case BoardConfig::ImuType::Lsm6ds3:
+    case BoardConfig::ImuType::Qmi8658:
       return true;
+    case BoardConfig::ImuType::Sc7a20h:
     case BoardConfig::ImuType::None:
       return false;
   }
@@ -354,6 +471,7 @@ bool Imu::begin() { return false; }
 bool Imu::read(Sample&) { return false; }
 bool Imu::sleep() { return false; }
 bool Imu::wake() { return false; }
+bool Imu::hasGyroscope() const { return false; }
 }  // namespace freeink
 
 #endif  // FREEINK_CAP_IMU

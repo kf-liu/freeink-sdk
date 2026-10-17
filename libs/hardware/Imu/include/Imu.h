@@ -8,11 +8,10 @@
 // access, mirroring BatteryMonitor. Boards without an IMU (FREEINK_CAP_IMU off,
 // or imuAddr == 0) link stub bodies and present() returns false.
 //
-// ImuType::Sc7a20h (Read Pico) has NO gyroscope: read() still succeeds and still
-// fills ax/ay/az, but gx/gy/gz are always 0. The Sample shape is deliberately
-// unchanged, so a consumer that derives a gesture from angular rate (e.g.
-// lib/hal/HalTiltSensor.cpp, whose tilt page turn needs ~270 dps) simply never
-// fires on such a board — see docs/engineering/read-pico.md for that gap.
+// ImuType::Sc7a20h has NO gyroscope: read() fills ax/ay/az and leaves gx/gy/gz
+// at 0. Read Pico keeps the 12.5 Hz low-power profile. Metalio E-Ink 4 uses
+// 100 Hz high-resolution mode, probes 0x19 then 0x18, and read() returns false
+// while asleep or until STATUS ZYXDA is set. See metalio-accelerometer.md.
 
 #include <Arduino.h>
 
@@ -44,8 +43,14 @@ class Imu {
   // error; allow for a settling transient before trusting samples.
   bool wake();
 
+  // False for an accelerometer-only part, and before begin() succeeds.
+  bool hasGyroscope() const;
+
  private:
   bool begun_ = false;
+  // Cleared by sleep() and failed begin()/wake(). read() returns false while
+  // this is clear, including when a powered-down SC7A20H still holds output data.
+  bool sampling_ = false;
   // The QMI8658 can legally appear at 0x6A or 0x6B depending on its SA0
   // strap. Keep the address found by begin() instead of repeatedly using the
   // board profile's preferred address.

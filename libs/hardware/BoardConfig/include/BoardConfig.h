@@ -354,8 +354,9 @@
 #define FREEINK_CAP_TEMP_HUMIDITY (FREEINK_DEVICE_STICKY)
 #endif
 #ifndef FREEINK_CAP_IMU
-#define FREEINK_CAP_IMU \
-  (FREEINK_DEVICE_X3 || FREEINK_DEVICE_STICKY || FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_READPICO || FREEINK_DEVICE_WS397)
+#define FREEINK_CAP_IMU                                                                                              \
+  (FREEINK_DEVICE_X3 || FREEINK_DEVICE_STICKY || FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_READPICO ||               \
+   FREEINK_DEVICE_METALIO_EINK4 || FREEINK_DEVICE_WS397)
 #endif
 // LEDC PWM buzzer (tone beeper). The Buzzer lib drives the AudioConfig.buzzer
 // pin; on for boards that wire one (Sticky GPIO48, Murphy GPIO46, PaperS3
@@ -1973,7 +1974,10 @@ constexpr BoardProfile METALIO_EINK4 = {
     // CX25601N at 0x6B is NOT BQ25896-compatible. Use gauge-native charging status.
     {41, 42, 400000, 0x55, 0, 0, GaugeType::Bq27220},
     NO_MIC,
-    {41, 42, 400000, 0x51, 0, 0, 0, RtcType::Pcf8563, ImuType::None},
+    // SC7A20H at 0x19 (WHO_AM_I 0x11, VERSION 0x28) on the shared SDA41/SCL42 bus.
+    // TCA9555 P1.4 interrupt is unused; the driver polls. Axis signs stay uncorrected
+    // until the physical mounting is checked.
+    {41, 42, 400000, 0x51, 0, 0x19, 0, RtcType::Pcf8563, ImuType::Sc7a20h},
     1.2f};
 static_assert(METALIO_EINK4.displayWidth / 8 * METALIO_EINK4.displayHeight == 48000);
 static_assert(METALIO_EINK4.sdmmc.busWidth == 1 && METALIO_EINK4.sdmmc.d3 == PIN_UNASSIGNED);
