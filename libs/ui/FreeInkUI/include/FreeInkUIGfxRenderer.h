@@ -303,7 +303,19 @@ class GfxRendererTarget final : public DrawTarget {
     // re-measures made every wrapped-capable label pay for wrapping it never
     // needed). Matters on e-paper list screens that rebuild every row per
     // repaint.
-    if (renderer.getTextWidth(fontId, text, epdStyle) <= rect.width) {
+    bool explicitBreak = false;
+    if (maxLines > 1) {
+      for (const char* scan = text; *scan != '\0'; ++scan) {
+        if (*scan == '\n') {
+          explicitBreak = true;
+          break;
+        }
+      }
+    }
+    // A newline has to go through wrappedText. Measuring the whole buffer can
+    // still come out narrower than the rect when each side is short, and the
+    // single-line path would draw both sides on one row.
+    if (!explicitBreak && renderer.getTextWidth(fontId, text, epdStyle) <= rect.width) {
       drawAligned(text, rect.y + std::max(0, (rect.height - lh) / 2));
       return;
     }
