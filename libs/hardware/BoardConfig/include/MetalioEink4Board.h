@@ -20,6 +20,7 @@ constexpr uint16_t OUTPUTS = USB_MUX_SEL | MAIN_POWER | SCREEN_POWER | TOUCH_RES
 constexpr uint16_t BOOT_OUTPUT = MAIN_POWER | POWER_PULSE | USB_MUX_SEL;
 inline uint16_t output = BOOT_OUTPUT;
 inline bool ready = false;
+inline bool railsLatched = false;
 inline bool bootPowerPending = true;
 
 inline bool powerButtonPressed(bool pressed) {
@@ -115,6 +116,18 @@ inline bool setOutput(uint16_t value) {
   return true;
 }
 
+// Assert MAIN and the power-key hold before any other boot work. A short press
+// only keeps the rail up until this write lands; screen power and touch reset stay
+// in begin() so they do not delay the latch.
+inline bool latchRails() {
+  if (railsLatched) return true;
+  if (!Wire.begin(41, 42, 400000)) return false;
+  Wire.setTimeOut(10);
+  if (!setOutput(BOOT_OUTPUT)) return false;
+  railsLatched = true;
+  return true;
+}
+
 inline bool begin() {
   if (ready) return true;
   pinMode(44, OUTPUT);
@@ -122,10 +135,8 @@ inline bool begin() {
   gpio_hold_dis(GPIO_NUM_44);  // Release the previous deep sleep's LOW hold, including capability-off builds.
   pinMode(46, INPUT_PULLUP);   // SD DAT3/CD: input-only, never part of the 1-bit data bus.
   pinMode(2, INPUT_PULLUP);
-  if (!Wire.begin(41, 42, 400000)) return false;
-  Wire.setTimeOut(10);
   // Set idle output levels BEFORE enabling the drivers: no low shutdown pulse.
-  if (!setOutput(BOOT_OUTPUT) || !write16(6, static_cast<uint16_t>(~OUTPUTS)) || !setOutput(output | SCREEN_POWER))
+  if (!latchRails() || !write16(6, static_cast<uint16_t>(~OUTPUTS)) || !setOutput(output | SCREEN_POWER))
     return false;
   delay(10);
   if (!setOutput(output | TOUCH_RESET)) return false;
@@ -133,6 +144,8 @@ inline bool begin() {
   ready = true;
   return true;
 }
+
+inline bool ensureBooted() { return begin(); }
 
 inline uint8_t buttons() {
   static uint32_t nextRead = 0;
