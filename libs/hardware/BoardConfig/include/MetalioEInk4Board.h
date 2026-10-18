@@ -20,6 +20,35 @@ constexpr uint8_t PIN_TOUCH_RESET = 9;
 constexpr uint8_t PIN_POWER_PULSE = 11;
 constexpr int VIBRATION_GPIO = 44;
 constexpr int SD_DAT3_GPIO = 46; // input-only; held high even with 1-bit SDMMC
+constexpr uint16_t OUTPUT_MASK = (1u << PIN_AMP_SELECT) | (1u << PIN_AMP_ENABLE) |
+                                  (1u << PIN_SCREEN_SD_POWER) | (1u << PIN_MAIN_POWER) |
+                                  (1u << PIN_TOUCH_RESET) | (1u << PIN_POWER_PULSE);
+constexpr uint16_t INPUT_MASK = (1u << PIN_VOLUME_DOWN) | (1u << PIN_VOLUME_UP) | (1u << 12);
+// 短按只把主电源保持到这一次输出寄存器写入完成。
+constexpr uint16_t POWER_HOLD_MASK = (1u << PIN_MAIN_POWER) | (1u << PIN_POWER_PULSE);
+
+// 总线可以已经打开，而锁存还没写成功。阶段只表达扩展器输出走到哪一步。
+enum class ExpanderPhase { Idle, Held, Ready };
+
+namespace detail {
+inline ExpanderPhase& expanderPhase() {
+  static auto phase = ExpanderPhase::Idle;
+  return phase;
+}
+
+inline bool& expanderBusStarted() {
+  static bool started = false;
+  return started;
+}
+
+inline bool startExpanderBus() {
+  if (expanderBusStarted()) return true;
+  if (!Wire.begin(41, 42, 400000)) return false;
+  Wire.setTimeOut(10);
+  expanderBusStarted() = true;
+  return true;
+}
+}  // namespace detail
 
 inline bool writeRegister(uint8_t reg, uint16_t value) {
   Wire.beginTransmission(EXPANDER_ADDR);
@@ -55,40 +84,36 @@ inline bool setOutput(uint8_t pin, bool high) {
   return writeRegister(2, high ? value | mask : value & ~mask);
 }
 
+// 在方向切换和触摸复位延时之前写下电源保持。读失败也要写，否则短按会在读寄存器时松开。
+inline bool latchRails() {
+  ExpanderPhase& phase = detail::expanderPhase();
+  if (phase == ExpanderPhase::Held || phase == ExpanderPhase::Ready) return true;
+  if (!detail::startExpanderBus()) return false;
+  uint16_t latch = POWER_HOLD_MASK;
+  if (readRegister(2, latch)) latch = (latch & ~OUTPUT_MASK) | POWER_HOLD_MASK;
+  if (!writeRegister(2, latch)) return false;
+  phase = ExpanderPhase::Held;
+  return true;
+}
+
 inline bool ensureBooted() {
-  static bool ready = false;
-  if (ready)
-    return true;
-  if (!Wire.begin(41, 42, 400000))
+  ExpanderPhase& phase = detail::expanderPhase();
+  if (phase == ExpanderPhase::Ready) return true;
+  if (!latchRails()) return false;
+  uint16_t config, polarity;
+  if (!readRegister(6, config) || !readRegister(4, polarity)) return false;
+  // 电平已经在 latchRails() 里写好，这里只打开方向，避免关机脉冲和功放爆音。
+  if (!writeRegister(6, (config & ~OUTPUT_MASK) | INPUT_MASK) || !writeRegister(4, polarity & ~INPUT_MASK))
     return false;
-  Wire.setTimeOut(10);
-  constexpr uint16_t outputs =
-      (1u << PIN_AMP_SELECT) | (1u << PIN_AMP_ENABLE) |
-      (1u << PIN_SCREEN_SD_POWER) | (1u << PIN_MAIN_POWER) |
-      (1u << PIN_TOUCH_RESET) | (1u << PIN_POWER_PULSE);
-  constexpr uint16_t inputs =
-      (1u << PIN_VOLUME_DOWN) | (1u << PIN_VOLUME_UP) | (1u << 12);
-  uint16_t latch, config, polarity;
-  if (!readRegister(2, latch) || !readRegister(6, config) ||
-      !readRegister(4, polarity))
-    return false;
-  // Set safe levels BEFORE switching directions: no shutdown pulse or amp pop.
-  latch = (latch & ~outputs) | (1u << PIN_MAIN_POWER) | (1u << PIN_POWER_PULSE);
-  if (!writeRegister(2, latch) ||
-      !writeRegister(6, (config & ~outputs) | inputs) ||
-      !writeRegister(4, polarity & ~inputs))
-    return false;
-  if (!setOutput(PIN_SCREEN_SD_POWER, true))
-    return false;
+  if (!setOutput(PIN_SCREEN_SD_POWER, true)) return false;
   delay(10);
-  if (!setOutput(PIN_TOUCH_RESET, true))
-    return false;
+  if (!setOutput(PIN_TOUCH_RESET, true)) return false;
   delay(120);
   pinMode(2, INPUT_PULLUP);
   pinMode(VIBRATION_GPIO, OUTPUT);
   digitalWrite(VIBRATION_GPIO, LOW);
   gpio_hold_dis(static_cast<gpio_num_t>(VIBRATION_GPIO));
-  ready = true;
+  phase = ExpanderPhase::Ready;
   return true;
 }
 
