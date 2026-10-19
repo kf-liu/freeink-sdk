@@ -1598,6 +1598,8 @@ constexpr BoardProfile METALIO_EINK4 = {
     NO_LEDS, NO_FLIP,
     // GPIO46 is input-only DAT3, unused in 1-bit mode; requires board pull-up.
     {38, 40, 39, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, 1},
+    // BQ27220 at 0x55 has no pack profile, so BatteryMonitor maps voltage
+    // (3300–4330 mV) instead of the SOC register.
     {41, 42, 400000, 0x55, 0},
     {MicInput::MetalioModule, 6, 17, PIN_UNASSIGNED, true},
     {41, 42, 400000, 0x51, 0, 0x19, 0, RtcType::Pcf8563, ImuType::Sc7a20h}, 1.25f,

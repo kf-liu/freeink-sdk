@@ -22,6 +22,8 @@ void BatteryMonitor::setPmuBatteryHook(const PmuBatteryHook hook) { g_pmuBattery
 
 #if FREEINK_BATTERY_I2C_GAUGE
 #include <Wire.h>
+
+#include "MetalioVoltageSoc.h"
 #if FREEINK_DEVICE_WS397
 #include <Axp2101.h>
 #endif
@@ -31,9 +33,11 @@ void BatteryMonitor::setPmuBatteryHook(const PmuBatteryHook hook) { g_pmuBattery
 // the gauge reports true battery state, so no ADC pin or divider is involved.
 // Addresses/pins come from BoardConfig::ACTIVE.batteryGauge.
 namespace {
-constexpr uint8_t BQ27220_VOLTAGE = 0x08;          // battery voltage, mV (u16 LE)
-constexpr uint8_t BQ27220_CURRENT = 0x0C;          // average current, signed mA (i16 LE)
-constexpr uint8_t BQ27220_STATE_OF_CHARGE = 0x2C;  // SoC, percent (u16 LE)
+constexpr uint8_t BQ27220_VOLTAGE = 0x08;  // battery voltage, mV (u16 LE)
+constexpr uint8_t BQ27220_CURRENT = 0x0C;  // average current, signed mA (i16 LE)
+#if !FREEINK_DEVICE_METALIO_EINK4
+constexpr uint8_t BQ27220_STATE_OF_CHARGE = 0x2C;  // SoC, percent (u16 LE). Metalio ignores this register.
+#endif
 constexpr uint8_t BQ25896_REG_STATUS = 0x0B;       // CHRG_STAT in bits [4:3]
 constexpr uint8_t SGM41562_REG_STATUS = 0x08;      // CHRG_STAT [4:3]; bit 1 = input present (stock)
 constexpr uint8_t SGM41562_REG_BATFET = 0x06;      // bit 5 = BATFET off (ship mode)
@@ -347,6 +351,26 @@ bool readPmuBattery(uint16_t& millivolts, uint16_t& socPermille, uint8_t& charge
   return g_pmuBatteryHook(millivolts, socPermille, chargeState);
 }
 
+#if FREEINK_DEVICE_METALIO_EINK4
+// 这块板的 BQ27220 没有电池曲线。显示电量走电压线性映射，不读 SOC 寄存器。
+// 滤波状态是静态的：一次 float 加几个整数，不进堆。
+bool readMetalioVoltageSoc(const uint8_t addr, uint16_t& out) {
+  uint16_t millivolts = 0;
+  if (!readReg16(addr, BQ27220_VOLTAGE, millivolts)) return false;
+
+  uint16_t rawCurrent = 0;
+  MetalioVoltageSocSample sample;
+  sample.millivolts = millivolts;
+  sample.nowMs = millis();
+  sample.currentKnown = readReg16(addr, BQ27220_CURRENT, rawCurrent);
+  if (sample.currentKnown) sample.currentMa = static_cast<int16_t>(rawCurrent);
+
+  static MetalioVoltageSocState state;
+  out = metalioVoltageSocUpdate(state, sample);
+  return true;
+}
+#endif
+
 // SoC (0..100) from the active gauge, dispatched by type. false on I2C failure.
 bool readGaugeSoc(uint16_t& out) {
   const auto& g = BoardConfig::ACTIVE.batteryGauge;
@@ -402,10 +426,14 @@ bool readGaugeSoc(uint16_t& out) {
     out = soc;
     return true;
   }
+#if FREEINK_DEVICE_METALIO_EINK4
+  return readMetalioVoltageSoc(g.gaugeAddr, out);
+#else
   uint16_t soc = 0;
   if (!readReg16(g.gaugeAddr, BQ27220_STATE_OF_CHARGE, soc)) return false;
   out = soc > 100 ? 100 : soc;
   return true;
+#endif
 }
 
 // Battery voltage (mV) from the active gauge, dispatched by type. false on failure.
