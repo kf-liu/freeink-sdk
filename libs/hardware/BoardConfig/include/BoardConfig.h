@@ -1971,7 +1971,9 @@ constexpr BoardProfile METALIO_EINK4 = {
     NO_LEDS,
     NO_FLIP,
     {38, 40, 39, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, 1},
-    // CX25601N at 0x6B is NOT BQ25896-compatible. Use gauge-native charging status.
+    // BQ27220 at 0x55 has no pack profile on this board, so BatteryMonitor maps
+    // voltage (3300–4330 mV) instead of the SOC register. CX25601N at 0x6B is
+    // not BQ25896-compatible; charge current still comes from the gauge.
     {41, 42, 400000, 0x55, 0, 0, GaugeType::Bq27220},
     NO_MIC,
     // SC7A20H at 0x19 (WHO_AM_I 0x11, VERSION 0x28) on the shared SDA41/SCL42 bus.
